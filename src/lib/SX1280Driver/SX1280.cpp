@@ -68,13 +68,21 @@ void SX1280Driver::End()
     PayloadLength = 8; // Dummy default value which is overwritten during setup.
 }
 
-bool SX1280Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency)
+bool SX1280Driver::Begin(uint32_t minimumFrequency, uint32_t maximumFrequency, bool fastReset)
 {
     hal.init();
-    hal.IsrCallback_1 = &SX1280Driver::IsrCallback_1;
-    hal.IsrCallback_2 = &SX1280Driver::IsrCallback_2;
-
-    hal.reset();
+    if (fastReset)
+    {
+        if (!hal.fastReset())
+        {
+            return false;
+        }
+    }
+    else
+    {
+        EnableIsrCallbacks(true);
+        hal.reset();
+    }
     DBGLN("SX1280 Begin");
 
     RFAMP.init();
@@ -134,6 +142,30 @@ transitioning from FS mode and the other from Standby mode. This causes the tx d
     return true;
 }
 
+void SX1280Driver::EnableIsrCallbacks(bool enable)
+{
+    hal.IsrCallback_1 = enable ? &SX1280Driver::IsrCallback_1 : nullptr;
+    hal.IsrCallback_2 = enable ? &SX1280Driver::IsrCallback_2 : nullptr;
+}
+
+bool SX1280Driver::ReadyForCommand()
+{
+    return hal.ReadyForCommand();
+}
+
+bool SX1280Driver::VerifyConfig()
+{
+    const uint8_t sensitivityReg = hal.ReadRegister(SX1280WatchdogPolicy::REG_SENSITIVITY, SX12XX_Radio_1);
+    uint8_t packetType = 0xFF;
+    hal.ReadCommand(SX1280_RADIO_GET_PACKETTYPE, &packetType, 1, SX12XX_Radio_1);
+    uint8_t modemRegs[SX1280WatchdogPolicy::MODEM_REGS_MAX] = {};
+    for (uint8_t index = 0; index < writtenConfig.modemRegCount && index < SX1280WatchdogPolicy::MODEM_REGS_MAX; index++)
+    {
+        modemRegs[index] = hal.ReadRegister(writtenConfig.modemAddress[index], SX12XX_Radio_1);
+    }
+    return SX1280WatchdogPolicy::configMatches(writtenConfig, sensitivityReg, packetType, modemRegs);
+}
+
 void SX1280Driver::startCWTest(uint32_t freq, SX12XX_Radio_Number_t radioNumber)
 {
     uint8_t buffer;         // we just need a buffer for the write command
@@ -153,6 +185,7 @@ void SX1280Driver::Config(uint8_t bw, uint8_t sf, uint8_t cr, uint32_t regfreq,
     PayloadLength = _PayloadLength;
     IQinverted = InvertIQ;
     packet_mode = mode;
+    writtenConfig.packetType = mode;
     SetMode(SX1280_MODE_STDBY_RC, SX12XX_Radio_All);
     hal.WriteCommand(SX1280_RADIO_SET_PACKETTYPE, mode, SX12XX_Radio_All, 20);
     if (mode == SX1280_PACKET_TYPE_FLRC)
@@ -279,13 +312,16 @@ void SX1280Driver::ConfigModParamsLoRa(uint8_t bw, uint8_t sf, uint8_t cr)
     {
     case SX1280_LORA_SF5:
     case SX1280_LORA_SF6:
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, 0, SX1280_REG_SF_ADDITIONAL_CONFIG, 0x1E, 0xFF);
         hal.WriteRegister(SX1280_REG_SF_ADDITIONAL_CONFIG, 0x1E, SX12XX_Radio_All); // for SF5 or SF6
         break;
     case SX1280_LORA_SF7:
     case SX1280_LORA_SF8:
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, 0, SX1280_REG_SF_ADDITIONAL_CONFIG, 0x37, 0xFF);
         hal.WriteRegister(SX1280_REG_SF_ADDITIONAL_CONFIG, 0x37, SX12XX_Radio_All); // for SF7 or SF8
         break;
     default:
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, 0, SX1280_REG_SF_ADDITIONAL_CONFIG, 0x32, 0xFF);
         hal.WriteRegister(SX1280_REG_SF_ADDITIONAL_CONFIG, 0x32, SX12XX_Radio_All); // for SF9, SF10, SF11, SF12
     }
     // Datasheet in LoRa Operation says "After SetModulationParams command:
@@ -310,6 +346,19 @@ void SX1280Driver::SetPacketParamsLoRa(uint8_t PreambleLength, SX1280_RadioLoRaP
     buf[6] = 0x00;
 
     hal.WriteCommand(SX1280_RADIO_SET_PACKETPARAMS, buf, sizeof(buf), SX12XX_Radio_All, 20);
+    // Read-back image (SX1280WatchdogPolicy): header mode bit, and the payload length where the datasheet documents it
+    // (implicit header = fixed length, the ELRS mode).
+    if (HeaderType == SX1280_LORA_PACKET_FIXED_LENGTH)
+    {
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, 1, SX1280WatchdogPolicy::REG_LORA_PAYLOAD_LENGTH, PayloadLength, 0xFF);
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, 2, SX1280WatchdogPolicy::REG_LORA_HEADER_MODE,
+                                             SX1280WatchdogPolicy::LORA_HEADER_MODE_IMPLICIT_BIT, SX1280WatchdogPolicy::LORA_HEADER_MODE_IMPLICIT_BIT);
+    }
+    else
+    {
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, 1, SX1280WatchdogPolicy::REG_LORA_HEADER_MODE, 0x00,
+                                             SX1280WatchdogPolicy::LORA_HEADER_MODE_IMPLICIT_BIT);
+    }
 
     // FEI only triggers in Lora mode when the header is present :(
     modeSupportsFei = HeaderType == SX1280_LORA_PACKET_VARIABLE_LENGTH;
@@ -345,6 +394,10 @@ void SX1280Driver::SetPacketParamsFLRC(uint8_t HeaderType,
     buf[0] = (uint8_t)(crcSeed >> 8);
     buf[1] = (uint8_t)crcSeed;
     hal.WriteRegister(SX1280_REG_FLRC_CRC_SEED, buf, 2, SX12XX_Radio_All);
+    for (uint8_t index = 0; index < 2; index++)
+    {
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, index, SX1280_REG_FLRC_CRC_SEED + index, buf[index], 0xFF);
+    }
 
     // Set SyncWord1
     buf[0] = (uint8_t)(syncWord >> 24);
@@ -366,6 +419,10 @@ void SX1280Driver::SetPacketParamsFLRC(uint8_t HeaderType,
     }
 
     hal.WriteRegister(SX1280_REG_FLRC_SYNC_WORD, buf, 4, SX12XX_Radio_All);
+    for (uint8_t index = 0; index < 4; index++)
+    {
+        SX1280WatchdogPolicy::recordModemReg(writtenConfig, (uint8_t)(2 + index), SX1280_REG_FLRC_SYNC_WORD + index, buf[index], 0xFF);
+    }
 
     // FEI only works in Lora and Ranging mode
     modeSupportsFei = false;
@@ -542,6 +599,16 @@ bool ICACHE_RAM_ATTR SX1280Driver::GetRxBufferAddr(SX12XX_Radio_Number_t radioNu
 
     *rxBufferAddr = status[1];
 
+#if defined(TARGET_RX)
+    if ((chipStatus & STATUS_MODE_MASK) == 0)
+    {
+        modeZeroReads = modeZeroReads < 255 ? modeZeroReads + 1 : 255;
+    }
+    else
+    {
+        modeZeroReads = 0;
+    }
+#endif
     return chipStatus == (SX1280_STATUS_CIRCUIT_MODE_RX | SX1280_STATUS_COMMAND_DATA_AVAILABLE);
 }
 
@@ -554,6 +621,13 @@ bool ICACHE_RAM_ATTR SX1280Driver::GetFrequencyErrorbool(SX12XX_Radio_Number_t r
         return IQinverted;
     else
         return !IQinverted;
+}
+
+uint8_t SX1280Driver::GetRssiInstRaw(SX12XX_Radio_Number_t radioNumber)
+{
+    uint8_t raw = 0;
+    hal.ReadCommand(SX1280_RADIO_GET_RSSIINST, &raw, 1, radioNumber);
+    return raw;
 }
 
 int8_t ICACHE_RAM_ATTR SX1280Driver::GetRssiInst(SX12XX_Radio_Number_t radioNumber)
@@ -698,8 +772,17 @@ void ICACHE_RAM_ATTR SX1280Driver::IsrCallback_2()
     instance->IsrCallback(SX12XX_Radio_2);
 }
 
+uint8_t SX1280Driver::GetStatusByte(SX12XX_Radio_Number_t radioNumber)
+{
+    uint8_t unused = 0;  // no data bytes; a valid pointer for the HAL's memcpy of size 0
+    return (uint8_t)hal.ReadCommand(SX1280_RADIO_GET_STATUS, &unused, 0, radioNumber);
+}
+
 void ICACHE_RAM_ATTR SX1280Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber)
 {
+#if defined(TARGET_RX)
+    bool rxDoneHandled = false;
+#endif
     instance->processingPacketRadio = radioNumber;
     SX12XX_Radio_Number_t irqClearRadio = radioNumber;
 
@@ -712,6 +795,9 @@ void ICACHE_RAM_ATTR SX1280Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber
     }
     else if (irqStatus & SX1280_IRQ_RX_DONE)
     {
+#if defined(TARGET_RX)
+        rxDoneHandled = true;
+#endif
         if (instance->RXnbISR(irqStatus, radioNumber))
         {
             irqClearRadio = SX12XX_Radio_All; // Packet received so clear all radios and dont spend extra time retrieving data.
@@ -727,5 +813,20 @@ void ICACHE_RAM_ATTR SX1280Driver::IsrCallback(SX12XX_Radio_Number_t radioNumber
     {
         return;
     }
+#if defined(TARGET_RX)
+    if (rxDoneHandled && instance->watchdogEnabled)
+    {
+        instance->rxDoneCount = (uint8_t)(instance->rxDoneCount + 1);
+        // Same clear as ClearIrqStatus() below, but keeping the status byte (watchdog: single-radio receivers only).
+        uint8_t buf[2] = {(uint8_t)(SX1280_IRQ_RADIO_ALL >> 8), (uint8_t)(SX1280_IRQ_RADIO_ALL & 0xFF)};
+        const uint8_t clearStatus = hal.WriteCommandStatus(SX1280_RADIO_CLR_IRQSTATUS, buf, sizeof(buf), irqClearRadio);
+        if ((clearStatus & STATUS_MODE_MASK) == SX1280_STATUS_CIRCUIT_MODE_RX && (clearStatus & STATUS_COMMAND_MASK) == 0)
+        {
+            instance->clearSuspectMicros = micros();
+            instance->clearSuspect = true;
+        }
+        return;
+    }
+#endif
     instance->ClearIrqStatus(SX1280_IRQ_RADIO_ALL, irqClearRadio);
 }

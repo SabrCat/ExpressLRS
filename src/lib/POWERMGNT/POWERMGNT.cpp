@@ -239,6 +239,13 @@ void POWERMGNT::setDefaultPower()
     setPower(getDefaultPower());
 }
 
+void POWERMGNT::reapplyPower()
+{
+    const PowerLevels_e power = CurrentPower;
+    CurrentPower = PWR_COUNT;  // defeat setPower()'s "unchanged" shortcut
+    setPower(power);
+}
+
 void POWERMGNT::setPower(PowerLevels_e Power)
 {
     Power = constrain(Power, getMinPower(), getMaxPower());

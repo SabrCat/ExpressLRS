@@ -121,6 +121,66 @@ void SX1280Hal::reset(void)
     DBGLN("SX1280 Ready!");
 }
 
+/**
+ * Watchdog reset: short NRESET pulse, then wait for the restarted chip by MEASURED start-up behaviour, never by the
+ * status byte alone. Bench (Nano, BUSY pin, 100 us and 1 ms pulses): the status reads STDBY_RC from ~375 us after the
+ * release, but BUSY stays high until 1434-1455 us - the chip calibrates in STDBY_RC, so 'standby' is not 'ready'.
+ * - BUSY pin: BUSY low is the ready signal; the first sample is taken FAST_RESET_BUSY_FIRST_SAMPLE_US after the release
+ *   (the chip may not drive BUSY yet in the first moments), bounded by FAST_RESET_BUSY_TIMEOUT_US.
+ * - No BUSY pin: no SPI at all for FAST_RESET_NO_BUSY_WAIT_US (~2x the measured ready time; the chip firmware is the
+ *   same A9B7 on both bench boards), then the status must read STDBY_RC. The caller verifies the configuration by
+ *   read-back afterwards, which catches a chip that was not ready after all.
+ * Interrupts stay enabled throughout (loop context). Returns false if the chip did not come up.
+ */
+bool SX1280Hal::fastReset()
+{
+    using namespace SX1280WatchdogPolicy;
+    if (GPIO_PIN_RST == UNDEF_PIN)
+    {
+        // No reset line: nothing restarts and there is nothing to wait for. The watchdog keeps the chip awake (no End())
+        // and Begin re-runs its configuration on the running chip; Begin's SetStandby + firmware-version read is the
+        // liveness check and the caller's read-back verifies the result.
+        return true;
+    }
+    pinMode(GPIO_PIN_RST, OUTPUT);
+    digitalWrite(GPIO_PIN_RST, LOW);
+    delayMicroseconds(FAST_RESET_PULSE_US);
+    digitalWrite(GPIO_PIN_RST, HIGH);
+    BusyDelayDuration = 0; // allowances of commands sent before the reset do not apply to the restarted chip
+
+    const uint32_t release = micros();
+    if (GPIO_PIN_BUSY != UNDEF_PIN)
+    {
+        delayMicroseconds(FAST_RESET_BUSY_FIRST_SAMPLE_US);
+        while (digitalRead(GPIO_PIN_BUSY) == HIGH)
+        {
+            if (micros() - release >= FAST_RESET_BUSY_TIMEOUT_US)
+            {
+                DBGLN("SX1280 fast reset: BUSY still high");
+                return false;
+            }
+        }
+    }
+    else
+    {
+        delayMicroseconds(FAST_RESET_NO_BUSY_WAIT_US);
+    }
+    uint8_t unused = 0; // no data bytes; a valid pointer for ReadCommand's memcpy of size 0
+    const uint8_t status = (uint8_t)ReadCommand(SX1280_RADIO_GET_STATUS, &unused, 0, SX12XX_Radio_1);
+    const bool standby = (status & SX1280Driver::STATUS_MODE_MASK) == SX1280_STATUS_CIRCUIT_MODE_STDBY_RC;
+    DBGLN("SX1280 fast reset: %u us, status %x", micros() - release, status);
+    return standby;
+}
+
+bool SX1280Hal::ReadyForCommand()
+{
+    if (GPIO_PIN_BUSY != UNDEF_PIN)
+    {
+        return digitalRead(GPIO_PIN_BUSY) == LOW;
+    }
+    return (micros() - BusyDelayStart) >= BusyDelayDuration;
+}
+
 void ICACHE_RAM_ATTR SX1280Hal::WriteCommand(SX1280_RadioCommands_t command, uint8_t val, SX12XX_Radio_Number_t radioNumber, uint32_t busyDelay)
 {
     WriteCommand(command, &val, 1, radioNumber, busyDelay);
@@ -138,6 +198,21 @@ void ICACHE_RAM_ATTR SX1280Hal::WriteCommand(SX1280_RadioCommands_t command, uin
     SPIEx.write(radioNumber, OutBuffer, size + 1);
 
     BusyDelay(busyDelay);
+}
+
+uint8_t ICACHE_RAM_ATTR SX1280Hal::WriteCommandStatus(SX1280_RadioCommands_t command, uint8_t *buffer, uint8_t size, SX12XX_Radio_Number_t radioNumber, uint32_t busyDelay)
+{
+    WORD_ALIGNED_ATTR uint8_t OutBuffer[WORD_PADDED(size + 1)] = {
+        command,
+    };
+
+    memcpy(OutBuffer + 1, buffer, size);
+
+    WaitOnBusy(radioNumber);
+    SPIEx.read(radioNumber, OutBuffer, size + 1); // full duplex: the bus sees the same bytes as write()
+
+    BusyDelay(busyDelay);
+    return OutBuffer[0];
 }
 
 SX1280_RadioStatus_t ICACHE_RAM_ATTR SX1280Hal::ReadCommand(SX1280_RadioCommands_t command, uint8_t *buffer, uint8_t size, SX12XX_Radio_Number_t radioNumber)

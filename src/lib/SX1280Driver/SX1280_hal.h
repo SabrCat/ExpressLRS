@@ -20,6 +20,7 @@ Heavily modified/simplified by Alessandro Carcione 2020 for ELRS project
 
 #include "SX1280_Regs.h"
 #include "SX1280.h"
+#include "SX1280_watchdog_policy.h"
 
 enum SX1280_BusyState_
 {
@@ -37,9 +38,22 @@ public:
     void init();
     void end();
     void reset();
+    // Receiver radio watchdog only (single-radio receivers): short reset pulse, then wait for the chip by its measured
+    // start-up behaviour (BUSY low where wired; otherwise a bounded wait of ~2x the measured ready time, no SPI) and
+    // require status STDBY_RC, instead of reset()'s ~110 ms of fixed waits. Returns false if the chip did not come up.
+    // Radio 1 only. Constants and their provenance: SX1280_watchdog_policy.h.
+    bool fastReset();
+    // True if a command to radio 1 could be sent now without waiting: BUSY low, or (no BUSY pin) the previous
+    // command's busy allowance has elapsed. Does not modify the allowance (unlike WaitOnBusy), so it is safe to call
+    // with interrupts enabled while the radio ISR may issue commands.
+    bool ReadyForCommand();
 
     void ICACHE_RAM_ATTR WriteCommand(SX1280_RadioCommands_t command, uint8_t val, SX12XX_Radio_Number_t radioNumber, uint32_t busyDelay = 15);
     void ICACHE_RAM_ATTR WriteCommand(SX1280_RadioCommands_t opcode, uint8_t *buffer, uint8_t size, SX12XX_Radio_Number_t radioNumber, uint32_t busyDelay = 15);
+    // Like WriteCommand (same bytes on the wire), but full duplex: returns the status byte the chip sends during the
+    // opcode. Kept as a separate copy on purpose: routing WriteCommand through a shared helper would add a call layer
+    // to every stock write (hop, Rx) and shift their timing, which matters on boards without a BUSY pin.
+    uint8_t ICACHE_RAM_ATTR WriteCommandStatus(SX1280_RadioCommands_t opcode, uint8_t *buffer, uint8_t size, SX12XX_Radio_Number_t radioNumber, uint32_t busyDelay = 15);
     void ICACHE_RAM_ATTR WriteRegister(uint16_t address, uint8_t *buffer, uint8_t size, SX12XX_Radio_Number_t radioNumber);
     void ICACHE_RAM_ATTR WriteRegister(uint16_t address, uint8_t value, SX12XX_Radio_Number_t radioNumber);
 

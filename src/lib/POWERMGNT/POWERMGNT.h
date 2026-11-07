@@ -52,6 +52,8 @@ public:
      * @param Power the power level to set
      */
     static void setPower(PowerLevels_e Power);
+    // Write the current power level to the radio again (after a radio reset), without init()'s calibration load.
+    static void reapplyPower();
 
     /**
      * @brief Increment to the next higher power level, capped at MaxPower

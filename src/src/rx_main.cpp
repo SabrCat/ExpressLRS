@@ -299,6 +299,30 @@ void ICACHE_RAM_ATTR getRFlinkInfo()
     #endif
 }
 
+// Radio modulation/packet setup for a rate, on the initial frequency. Used by SetRFLinkRate and by the radio
+// watchdog's reset (which must not touch the timer or apply a pending rate change).
+static void ConfigRadio(expresslrs_mod_settings_s *const ModParams, bool invertIQ)
+{
+    Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, FHSSgetInitialFreq(),
+                 ModParams->PreambleLen, invertIQ, ModParams->PayloadLength
+#if defined(RADIO_SX128X)
+                 , OtaGetUidSeed(), OtaCrcInitializer, ModParams->radio_type
+#endif
+#if defined(RADIO_LR1121)
+                 , ModParams->radio_type, (uint8_t)UID[5], (uint8_t)UID[4]
+#endif
+                 );
+
+#if defined(RADIO_LR1121)
+    if (FHSSuseDualBand)
+    {
+        Radio.Config(ModParams->bw2, ModParams->sf2, ModParams->cr2, FHSSgetInitialGeminiFreq(),
+                    ModParams->PreambleLen2, invertIQ, ModParams->PayloadLength,
+                    ModParams->radio_type, (uint8_t)UID[5], (uint8_t)UID[4], SX12XX_Radio_2);
+    }
+#endif
+}
+
 void SetRFLinkRate(uint8_t index, bool bindMode) // Set speed of RF link
 {
     expresslrs_mod_settings_s *const ModParams = get_elrs_airRateConfig(index);
@@ -319,24 +343,7 @@ void SetRFLinkRate(uint8_t index, bool bindMode) // Set speed of RF link
     FHSSuseDualBand = RadioBandMod::isBDUAL(ModParams->radio_type);
 #endif
 
-    Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, FHSSgetInitialFreq(),
-                 ModParams->PreambleLen, invertIQ, ModParams->PayloadLength
-#if defined(RADIO_SX128X)
-                 , OtaGetUidSeed(), OtaCrcInitializer, ModParams->radio_type
-#endif
-#if defined(RADIO_LR1121)
-                 , ModParams->radio_type, (uint8_t)UID[5], (uint8_t)UID[4]
-#endif
-                 );
-
-#if defined(RADIO_LR1121)
-    if (FHSSuseDualBand)
-    {
-        Radio.Config(ModParams->bw2, ModParams->sf2, ModParams->cr2, FHSSgetInitialGeminiFreq(),
-                    ModParams->PreambleLen2, invertIQ, ModParams->PayloadLength,
-                    ModParams->radio_type, (uint8_t)UID[5], (uint8_t)UID[4], SX12XX_Radio_2);
-    }
-#endif
+    ConfigRadio(ModParams, invertIQ);
 
     Radio.FuzzySNRThreshold = (RFperf->DynpowerSnrThreshUp == DYNPOWER_SNR_THRESH_NONE) ? 0 : (RFperf->DynpowerSnrThreshDn - RFperf->DynpowerSnrThreshUp);
 
@@ -361,6 +368,108 @@ void SetRFLinkRate(uint8_t index, bool bindMode) // Set speed of RF link
     LbtEnableIfRequired();
 }
 
+#if defined(RADIO_SX128X)
+// ---------------------------------------------------------------------------------------------------------------
+// Radio watchdog (issue #3835). Bench observations on an SX1280 receiver without a BUSY pin: the chip sometimes
+// ignores the RX_DONE handler's ClearIrqStatus (IRQ stays set, DIO1 stays high; the rising-edge interrupt never fires
+// again), or enters an undocumented circuit mode 0 that the 4.x status gate rejects. Stock firmware stays deaf until
+// power cycle in both cases. The watchdog only uses what the receive path already reads (the status byte returned by
+// the handler's clear, the gate's status byte) plus the DIO1 level at the tock, and repairs with verified steps:
+// a repeat clear >= 1 ms later (earlier repeats were ignored by the chip), standby + Rx for mode 0, and as the last
+// step a radio reset that keeps the hw timer and the FHSS position, so no resync is needed. Loop-side radio commands
+// mask interrupts only around each single command (radioWatchdogCommand). The reset never uses the stock reset's
+// ~110 ms of fixed waits: a short pulse, a wait set by the measured start-up time (BUSY low where wired), and a
+// read-back of the configuration; failed attempts are retried in three tiers (3 within half the failsafe budget of the
+// fastest rate, up to 8 within the 500/333 Hz budgets, then once per second for the rest of the flight; timings:
+// SX1280_watchdog_policy.h). A dead receive path (connected: no packets AND a pinned RSSI; disconnected: RSSI pinned
+// for ~0.5 s AND no RX_DONE) gets the Rx repair, then resets. A verified repair or reset must be followed by a valid
+// packet within a few slots while connected, else the loop escalates (not every configuration item can be read back).
+// ---------------------------------------------------------------------------------------------------------------
+static volatile bool radioWatchdogResetting = false;  // loop owns the radio: no hop write / telemetry from the tock
+static volatile bool radioWatchdogResetRequested = false;
+// The radio was not ready for the hand-back after an attempt (BUSY high / allowance running): the tock stays locked out
+// (radioWatchdogResetting) and the loop retries the hand-back every pass until the radio takes commands again.
+static bool radioWatchdogHandbackPending = false;
+// After a failed attempt, until a valid packet: the tock skips its radio commands while BUSY reads high, so a radio that
+// sticks busy again cannot make each stock command wait 1 ms inside the timer ISR (ESP8266 timer stall).
+static volatile bool radioWatchdogUnverified = false;
+static volatile bool radioWatchdogTockSkip = false;  // this tock: no hop write / telemetry (radio busy, see above)
+static volatile uint8_t radioWatchdogStage = 0;        // 1 / 2 = repeat clear sent, verify DIO1 at the next tock
+static volatile uint8_t radioWatchdogDio1HighTocks = 0;
+static int8_t radioWatchdogDio1Pin = UNDEF_PIN;
+static constexpr uint32_t RADIO_WATCHDOG_MIN_RETRY_US = 1000;       // repeat clears < ~300 us were ignored (bench)
+static constexpr uint8_t RADIO_WATCHDOG_STUCK_TOCKS = 2;            // DIO1 high at this many tocks in a row = stuck
+static constexpr uint32_t RADIO_WATCHDOG_STUCK_DISCONNECTED_MS = 10;
+static constexpr uint8_t RADIO_WATCHDOG_MODE_ZERO_READS = 2;
+static constexpr uint32_t RADIO_WATCHDOG_RX_KICK_MS = 1000;         // disconnected: re-enter Rx this often
+static constexpr uint8_t RADIO_WATCHDOG_RSSI_SAMPLES = SX1280WatchdogPolicy::RSSI_SAMPLES;
+static constexpr uint32_t RADIO_WATCHDOG_DIO1_SAMPLE_GAP_MS = 2;  // disconnected stuck-DIO1 check: longer loop gaps restart it
+// The radio frequency no longer matches the FHSS position: a reset configured the initial frequency (release retunes).
+static bool radioWatchdogFreqStale = false;
+static uint8_t radioWatchdogTakenFhssPtr = 0;  // FHSSptr when the loop took the radio (hops skipped since = it moved)
+
+#if defined(PLATFORM_ESP32)
+static portMUX_TYPE radioWatchdogMux = portMUX_INITIALIZER_UNLOCKED;
+#define RADIO_WATCHDOG_LOCK() portENTER_CRITICAL(&radioWatchdogMux)
+#define RADIO_WATCHDOG_UNLOCK() portEXIT_CRITICAL(&radioWatchdogMux)
+#else
+#define RADIO_WATCHDOG_LOCK() noInterrupts()
+#define RADIO_WATCHDOG_UNLOCK() interrupts()
+#endif
+// Bound for radioWatchdogCommand's ready wait: the longest stock busy allowance is SetStandby(RC)'s 1500 us; with a
+// BUSY pin the chip's own busy time is far shorter (WaitOnBusy gives up after 1 ms).
+static constexpr uint32_t RADIO_WATCHDOG_READY_TIMEOUT_US = SX1280WatchdogPolicy::COMMAND_READY_TIMEOUT_US;
+
+static void ICACHE_RAM_ATTR radioWatchdogTock()
+{
+    radioWatchdogTockSkip = false;
+    if (!Radio.watchdogEnabled || radioWatchdogResetting)
+    {
+        return;
+    }
+    if (radioWatchdogUnverified && GPIO_PIN_BUSY != UNDEF_PIN && digitalRead(GPIO_PIN_BUSY) == HIGH)
+    {
+        // The sequence still advances (HandleFHSS); the next hop that finds the radio ready retunes it.
+        radioWatchdogTockSkip = true;
+        return;
+    }
+    const bool dio1 = digitalRead((uint8_t)radioWatchdogDio1Pin);
+    radioWatchdogDio1HighTocks = dio1 ? (uint8_t)(radioWatchdogDio1HighTocks < 255 ? radioWatchdogDio1HighTocks + 1 : 255) : 0;
+    if (radioWatchdogStage != 0)
+    {
+        if (!dio1)
+        {
+            radioWatchdogStage = 0;  // verified: the repeat clear took effect
+            // While the IRQ was stuck, a telemetry TX_DONE raised no edge, so TXdoneISR never put the radio back
+            // into Rx (it would sit in FS). Re-enter Rx; the tock is ~200 us after RX done, before the next preamble.
+            Radio.RXnb();
+            return;
+        }
+        if (radioWatchdogStage == 2)
+        {
+            radioWatchdogStage = 0;
+            radioWatchdogResetRequested = true;
+            return;
+        }
+        Radio.ClearIrqStatus(SX1280_IRQ_RADIO_ALL, SX12XX_Radio_All);
+        radioWatchdogStage = 2;
+        return;
+    }
+    // DIO1 high at two tocks in a row (one packet interval apart) or a suspect clear at least 1 ms old.
+    const bool suspectDue = Radio.clearSuspect && (micros() - Radio.clearSuspectMicros) >= RADIO_WATCHDOG_MIN_RETRY_US;
+    if (suspectDue || radioWatchdogDio1HighTocks >= RADIO_WATCHDOG_STUCK_TOCKS)
+    {
+        Radio.clearSuspect = false;
+        if (!dio1)
+        {
+            return;  // the handler's clear did work
+        }
+        Radio.ClearIrqStatus(SX1280_IRQ_RADIO_ALL, SX12XX_Radio_All);
+        radioWatchdogStage = 1;
+    }
+}
+#endif
+
 static void ICACHE_RAM_ATTR HandleFHSS()
 {
     uint8_t modresultFHSS = OtaNonce % ExpressLRS_currAirRate_Modparams->FHSShopInterval;
@@ -369,6 +478,13 @@ static void ICACHE_RAM_ATTR HandleFHSS()
     {
         return;
     }
+#if defined(RADIO_SX128X)
+    if (radioWatchdogResetting || radioWatchdogTockSkip)
+    {
+        FHSSgetNextFreq();  // keep the sequence position; the radio is retuned at the release / the next hop
+        return;
+    }
+#endif
 
     if (geminiMode)
     {
@@ -451,6 +567,12 @@ void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
 
 bool ICACHE_RAM_ATTR HandleSendDataDl()
 {
+#if defined(RADIO_SX128X)
+    if (radioWatchdogResetting || radioWatchdogTockSkip)
+    {
+        return false;  // the loop owns the radio, or it is busy after a failed attempt
+    }
+#endif
     uint8_t modresult = OtaNonce % ExpressLRS_currTlmDenom;
 
     if ((connectionState == disconnected) || (ExpressLRS_currTlmDenom == 1) || (alreadyTLMresp == true) || (modresult != 0) || !teamraceHasModelMatch)
@@ -779,6 +901,9 @@ void ICACHE_RAM_ATTR HWtimerCallbackTock()
     sendImmediateRC();
 
     OtaNonce++;
+#if defined(RADIO_SX128X)
+    radioWatchdogTock();  // before the hop: the HAL busy timer spaces the hop after a repair clear
+#endif
     HandleFHSS();
     updateDiversity();
     bool tlmSent = HandleSendDataDl();
@@ -2042,6 +2167,11 @@ void setup()
 
         if (connectionState != radioFailed)
         {
+#if defined(RADIO_SX128X)
+            // Single-radio receivers only: with two radios both chips drive MISO during shared opcodes.
+            radioWatchdogDio1Pin = GPIO_PIN_DIO1;
+            Radio.watchdogEnabled = !isDualRadio() && radioWatchdogDio1Pin != UNDEF_PIN;
+#endif
             // RFnoiseFloor = MeasureNoiseFloor(); //TODO move MeasureNoiseFloor to driver libs
             // DBGLN("RF noise floor: %d dBm", RFnoiseFloor);
 
@@ -2061,6 +2191,374 @@ void setup()
     RFmodeLastCycled = millis();
 }
 
+#if defined(RADIO_SX128X)
+/**
+ * Runs one radio command from the loop with interrupts masked only around the command itself (a few us), never
+ * across a busy wait: the wait for the previous command's busy time (BUSY pin, or the fixed allowance on boards
+ * without BUSY, up to 1500 us after SetStandby) happens before the lock, and readiness is re-checked inside it in
+ * case the radio ISR or the tock sent a command meanwhile. Masking longer than half a packet interval would make the
+ * ESP8266 hw timer miss its absolute compare target (~27 s without tick/tock). The lock also keeps the radio ISR from
+ * running SPI while the loop is mid-transaction. Returns false (command not sent) if the radio stays busy.
+ */
+template <typename Command>
+static bool radioWatchdogCommand(Command command, uint32_t readyTimeoutUs = RADIO_WATCHDOG_READY_TIMEOUT_US)
+{
+    const uint32_t start = micros();
+    do
+    {
+        if (Radio.ReadyForCommand())
+        {
+            RADIO_WATCHDOG_LOCK();
+            const bool ready = Radio.ReadyForCommand();
+            if (ready)
+            {
+                command();
+            }
+            RADIO_WATCHDOG_UNLOCK();
+            if (ready)
+            {
+                return true;
+            }
+        }
+    } while (micros() - start < readyTimeoutUs);
+    return false;
+}
+
+static bool radioWatchdogInRx()
+{
+    bool inRx = false;
+    radioWatchdogCommand([&inRx]() {
+        inRx = (Radio.GetStatusByte(SX12XX_Radio_1) & SX1280Driver::STATUS_MODE_MASK) == SX1280_STATUS_CIRCUIT_MODE_RX;
+    });
+    return inRx;
+}
+
+static bool radioWatchdogRssiRaw(uint8_t &raw)
+{
+    return radioWatchdogCommand([&raw]() { raw = Radio.GetRssiInstRaw(SX12XX_Radio_1); });
+}
+
+/**
+ * Bench: in the dead receive path the status byte says Rx but the instantaneous RSSI is pinned at one value.
+ * Stops at the first moving sample, and at the first command the radio does not take (one ready timeout, not 16).
+ */
+static bool radioWatchdogRssiMoves()
+{
+    uint8_t first = 0;
+    if (!radioWatchdogRssiRaw(first))
+    {
+        return false;
+    }
+    for (uint8_t sample = 1; sample < RADIO_WATCHDOG_RSSI_SAMPLES; sample++)
+    {
+        delayMicroseconds(100);
+        uint8_t raw = 0;
+        if (!radioWatchdogRssiRaw(raw))
+        {
+            return false;
+        }
+        if (raw != first)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Releases the tock: back to the current FHSS channel if the sequence is live. Only if the radio takes the command
+ * (BUSY low / allowance elapsed); returns false otherwise and the tock stays locked out (see radioWatchdogHandback).
+ */
+static bool radioWatchdogRelease(uint32_t readyTimeoutUs = RADIO_WATCHDOG_READY_TIMEOUT_US)
+{
+    return radioWatchdogCommand([]() {
+        radioWatchdogResetting = false;
+        const uint16_t count = FHSSgetSequenceCount();
+        const bool retune = radioWatchdogFreqStale || FHSSptr != radioWatchdogTakenFhssPtr;
+        radioWatchdogFreqStale = false;
+        // Only when needed: a hop write at an arbitrary loop time can abort a packet in flight (stock hops at the tock).
+        if (retune && hwTimer::running && connectionState != disconnected && count != 0)
+        {
+            // Hops were skipped (sequence advanced, no radio write) while the loop owned the radio: retune to the
+            // current channel and release in the same critical section, so no tock can advance the sequence in between.
+            const uint8_t savedPtr = FHSSptr;
+            FHSSptr = (uint8_t)((savedPtr + count - 1) % count);
+            const uint32_t freq = FHSSgetNextFreq();  // the current channel; FHSSptr is back at savedPtr
+            Radio.SetFrequencyReg(freq, SX12XX_Radio_All, false);
+        }
+        // else: no hop skipped and no reset, or disconnected (the radio stays on the initial frequency, as stock)
+    }, readyTimeoutUs);
+}
+
+/**
+ * Hands the radio back in the stock receive state: ISR callbacks on + Rx entered (one locked command), then the tock
+ * released. Each step only when the radio takes commands; otherwise the hand-back stays pending (tock locked out,
+ * callbacks off) and the loop retries it every pass, so neither the tock nor the radio ISR meets a busy radio.
+ */
+static bool radioWatchdogHandback(uint32_t readyTimeoutUs)
+{
+    radioWatchdogHandbackPending =
+        !(radioWatchdogCommand([]() { Radio.EnableIsrCallbacks(true); Radio.RXnb(); }, readyTimeoutUs) &&
+          radioWatchdogRelease(readyTimeoutUs));
+    return !radioWatchdogHandbackPending;
+}
+
+/** The loop takes the radio from the tock: no hop write / telemetry until the release. */
+static void radioWatchdogTake()
+{
+    radioWatchdogTakenFhssPtr = FHSSptr;
+    radioWatchdogResetting = true;
+}
+
+/**
+ * Receive-path repair without a reset (bench, 12 of 12: after circuit mode 0 the first Rx entry leaves a dead receive
+ * path, a second one repairs it): Rx, standby, Rx, verified by status Rx and (requireRssiMoving: a transmitter is on
+ * the air) a moving RSSI. While disconnected the band may be quiet, so the slow idle detector judges the RSSI instead.
+ * The radio ISR callbacks are off from the standby until the second Rx entry, so an RX ISR cannot spend SetStandby's
+ * 1500 us busy allowance spinning in interrupt context (a DIO1 edge dropped meanwhile leaves DIO1 high, which the
+ * tock's stuck check repairs).
+ */
+static bool radioWatchdogRxRepair(bool requireRssiMoving)
+{
+    radioWatchdogTake();
+    const bool sent = radioWatchdogCommand([]() { Radio.RXnb(); }) &&
+                      radioWatchdogCommand([]() { Radio.EnableIsrCallbacks(false); Radio.SetStandbyRc(); }) &&
+                      radioWatchdogCommand([]() { Radio.RXnb(); Radio.EnableIsrCallbacks(true); });
+    if (!sent)
+    {
+        radioWatchdogHandback(SX1280WatchdogPolicy::HANDBACK_SINGLE_TRY_US);
+        return false;
+    }
+    const bool repaired = radioWatchdogInRx() && (!requireRssiMoving || radioWatchdogRssiMoves());
+    radioWatchdogHandbackPending = !radioWatchdogRelease();
+    return repaired;
+}
+
+/**
+ * Radio reset + init for the CURRENT rate and power, keeping timer and FHSS. Returns true if the chip is verified in Rx:
+ * configuration read back as written, status Rx, RSSI moving (requireRssiMoving). Reception itself is proven only by a
+ * valid packet afterwards (SX1280WatchdogPolicy reception proof). Never uses the stock reset (~110 ms of fixed waits).
+ * Boards without a reset line: no End() (it would put the chip to sleep, and only an accidental NSS edge would wake it):
+ * Begin's configuration runs again on the running chip (SX1280Hal::fastReset returns at once) and is verified the same way.
+ * The radio is handed back in the stock receive state as soon as it takes commands (radioWatchdogHandback); the loop
+ * retries failed attempts (SX1280WatchdogPolicy).
+ */
+static bool radioWatchdogReset(bool requireRssiMoving)
+{
+    radioWatchdogTake();
+    radioWatchdogFreqStale = true;  // Config below tunes the initial frequency
+    Radio.EnableIsrCallbacks(false);  // no radio ISR SPI until the radio is configured and back in Rx
+    if (GPIO_PIN_RST != UNDEF_PIN)
+    {
+        Radio.End();
+    }
+    Radio.currFreq = FHSSgetInitialFreq();
+    bool configured = Radio.Begin(FHSSgetMinimumFreq(), FHSSgetMaximumFreq(), true);
+    Radio.RXdoneCallback = &RXdoneISR;  // End() replaced them with the null callbacks; restored on every outcome
+    Radio.TXdoneCallback = &TXdoneISR;
+    if (configured)
+    {
+        ConfigRadio(ExpressLRS_currAirRate_Modparams, UID[5] & 0x01);
+        POWERMGNT::reapplyPower();
+        configured = Radio.VerifyConfig();
+    }
+    // After a failed attempt the hand-back tries each command once: a chip that did not come up gains nothing from the
+    // ready wait; if it is not ready, the hand-back stays pending and the loop retries it every pass.
+    const uint32_t readyTimeoutUs = configured ? RADIO_WATCHDOG_READY_TIMEOUT_US : SX1280WatchdogPolicy::HANDBACK_SINGLE_TRY_US;
+    if (!radioWatchdogCommand([]() { Radio.EnableIsrCallbacks(true); Radio.RXnb(); }, readyTimeoutUs))
+    {
+        radioWatchdogHandbackPending = true;
+        return false;
+    }
+    // Checked before the release (a telemetry slot could start a TX after it). A moving RSSI as well while a transmitter
+    // is on the air: a chip derailed during its start can report Rx without receiving (bench: 'status-only'). While
+    // disconnected the band may be quiet (no proof either way); the idle detector watches the RSSI over ~0.5 s instead.
+    const bool inRx = configured && radioWatchdogInRx() && (!requireRssiMoving || radioWatchdogRssiMoves());
+    radioWatchdogHandbackPending = !radioWatchdogRelease(readyTimeoutUs);
+    return inRx;
+}
+
+static void radioWatchdogLoop(unsigned long now)
+{
+    static unsigned long lastActionMs = 0;
+    static unsigned long lastRxKickMs = 0;
+    static unsigned long dio1HighSinceMs = 0;
+    static unsigned long lastDio1SampleMs = 0;
+    static unsigned long lastDeadPathCheckMs = 0;
+    static bool dio1HighSeen = false;
+    static SX1280WatchdogPolicy::RetryState retry;
+    static SX1280WatchdogPolicy::ReceptionProof repairProof;  // after a verified Rx repair while connected
+    static SX1280WatchdogPolicy::IdleDeadPath idle;
+    if (!Radio.watchdogEnabled)
+    {
+        return;
+    }
+    if (InBindingMode || connectionState >= MODE_STATES)
+    {
+        Radio.clearSuspect = false;
+        Radio.modeZeroReads = 0;
+        radioWatchdogResetRequested = false;
+        retry.retryPending = false;
+        retry.proof.pending = false;
+        repairProof.pending = false;
+        SX1280WatchdogPolicy::idleRestart(idle);
+        radioWatchdogStage = 0;
+        dio1HighSeen = false;
+        if (radioWatchdogHandbackPending)
+        {
+            // Binding / the other modes drive the radio themselves (stock): hand it back now. The tock still skips
+            // its commands while BUSY is high (radioWatchdogUnverified stays set until a valid packet).
+            radioWatchdogHandbackPending = false;
+            Radio.EnableIsrCallbacks(true);
+            radioWatchdogResetting = false;
+        }
+        return;
+    }
+    // Read once: the radio ISR writes it (a value newer than `now` is handled by the signed compares in the policy).
+    const uint32_t lastValidPacket = LastValidPacket;
+    // Packets are expected (a transmitter is on the air): the RSSI must move and a verified repair must be followed by
+    // a valid packet. Disconnected: the band may be quiet, the idle detector watches the radio instead.
+    const bool expectPackets = connectionState == connected && hwTimer::running;
+    const uint32_t intervalUs = (uint32_t)ExpressLRS_currAirRate_Modparams->interval;
+    SX1280WatchdogPolicy::onPacketEvidence(retry, lastValidPacket);
+    SX1280WatchdogPolicy::checkResetProof(retry, expectPackets, lastValidPacket, now, intervalUs);
+    if (!expectPackets)
+    {
+        repairProof.pending = false;
+    }
+    else if (SX1280WatchdogPolicy::proofFailed(repairProof, lastValidPacket, now, intervalUs))
+    {
+        radioWatchdogResetRequested = true;  // the repair verified, but nothing is received: escalate to a reset
+        DBGLN("radio watchdog: no packet after the Rx repair -> reset");
+    }
+    radioWatchdogUnverified = SX1280WatchdogPolicy::radioUnverified(retry);
+    if (radioWatchdogHandbackPending)
+    {
+        radioWatchdogHandback(SX1280WatchdogPolicy::HANDBACK_SINGLE_TRY_US);  // one try per loop pass, no waiting
+    }
+    if (!hwTimer::running)
+    {
+        // No tocks while disconnected: a flag left set here would keep the receiver deaf, so watch DIO1 from the loop.
+        // "Continuously high" needs dense samples: a loop pass gap longer than RADIO_WATCHDOG_DIO1_SAMPLE_GAP_MS (another
+        // task blocked the loop) restarts the measurement, so two packet edges far apart cannot look like a stuck line.
+        const bool denseSamples = now - lastDio1SampleMs <= RADIO_WATCHDOG_DIO1_SAMPLE_GAP_MS;
+        lastDio1SampleMs = now;
+        if (digitalRead((uint8_t)radioWatchdogDio1Pin) && denseSamples)
+        {
+            if (!dio1HighSeen)
+            {
+                dio1HighSeen = true;
+                dio1HighSinceMs = now;
+            }
+            if (now - dio1HighSinceMs >= RADIO_WATCHDOG_STUCK_DISCONNECTED_MS)
+            {
+                radioWatchdogResetRequested = true;
+            }
+        }
+        else
+        {
+            dio1HighSeen = false;
+        }
+    }
+    const bool repairAllowed = !radioWatchdogResetRequested && !radioWatchdogHandbackPending &&
+                               now - lastActionMs >= SX1280WatchdogPolicy::ACTION_SPACING_MS;
+    const bool idleListening = connectionState == disconnected && !hwTimer::running;
+    if (idleListening && repairAllowed && now - lastRxKickMs >= RADIO_WATCHDOG_RX_KICK_MS)
+    {
+        // Bench: after the stock reconfigure of a chip in circuit mode 0 the receive path is dead (status Rx, RSSI
+        // pinned, no packets) and one more Rx entry revives it; with lock-on-first-connection nothing else would ever
+        // re-enter Rx while disconnected. Costs at most one missed sync packet per second.
+        lastRxKickMs = now;
+        radioWatchdogCommand([]() {
+            if (!hwTimer::running)  // re-checked inside the lock: a SYNC packet may have restarted the timer meanwhile
+            {
+                Radio.RXnb();
+            }
+        });
+    }
+    if (!idleListening)
+    {
+        SX1280WatchdogPolicy::idleRestart(idle);
+    }
+    else if (repairAllowed && !retry.retryPending && SX1280WatchdogPolicy::idleSampleDue(idle, now))
+    {
+        // Dead receive path while disconnected:the same repair ladder as while connected (double Rx
+        // entry, then resets with the normal tiers), driven by the slow flat-RSSI + no-RX_DONE detector (policy).
+        uint8_t raw = 0;
+        if (radioWatchdogRssiRaw(raw))
+        {
+            const SX1280WatchdogPolicy::IdleAction action = SX1280WatchdogPolicy::idleOnSample(idle, raw, Radio.rxDoneCount, now);
+            if (action == SX1280WatchdogPolicy::IDLE_RX_REPAIR)
+            {
+                lastActionMs = now;
+                const bool repaired = radioWatchdogRxRepair(false);
+                radioWatchdogResetRequested = !repaired;
+                DBGLN("radio watchdog: idle RSSI pinned -> Rx twice, status Rx %d", repaired);
+                return;
+            }
+            if (action == SX1280WatchdogPolicy::IDLE_RESET)
+            {
+                radioWatchdogResetRequested = true;
+                DBGLN("radio watchdog: idle RSSI still pinned -> reset");
+            }
+        }
+    }
+    if (Radio.modeZeroReads >= RADIO_WATCHDOG_MODE_ZERO_READS && repairAllowed)
+    {
+        lastActionMs = now;
+        Radio.modeZeroReads = 0;
+        const bool repaired = radioWatchdogRxRepair(expectPackets);
+        // A failed repair goes straight to a reset; the reset spacing (not the action spacing) applies to it. A verified
+        // one must be followed by a valid packet (repairProof).
+        radioWatchdogResetRequested = !repaired;
+        if (repaired && expectPackets)
+        {
+            SX1280WatchdogPolicy::startProof(repairProof, now, millis());
+        }
+        DBGLN("radio watchdog: mode 0 -> Rx twice, repaired %d", repaired);
+        return;
+    }
+    if (expectPackets && repairAllowed && !retry.retryPending && !retry.proof.pending && !repairProof.pending &&
+        SX1280WatchdogPolicy::deadPathCheckDue(now, lastValidPacket, lastDeadPathCheckMs, intervalUs))
+    {
+        // Fault (c) while connected: no packet for DEAD_PATH_SLOTS intervals AND the RSSI pinned. A fade (RSSI moving)
+        // costs this read-only check once per window and nothing else.
+        lastDeadPathCheckMs = now;
+        if (!radioWatchdogRssiMoves())
+        {
+            lastActionMs = now;
+            const bool repaired = radioWatchdogRxRepair(true);
+            radioWatchdogResetRequested = !repaired;
+            if (repaired)
+            {
+                SX1280WatchdogPolicy::startProof(repairProof, now, millis());
+            }
+            DBGLN("radio watchdog: dead path -> Rx twice, repaired %d", repaired);
+            return;
+        }
+    }
+    if (!SX1280WatchdogPolicy::attemptDue(retry, radioWatchdogResetRequested, now))
+    {
+        return;
+    }
+    lastActionMs = now;
+    radioWatchdogResetRequested = false;
+    repairProof.pending = false;
+    // Set before the attempt: its release hands the radio to the tock, which must already see "unverified".
+    // Stays set until a valid packet (radioUnverified: any attempt counts until then).
+    radioWatchdogUnverified = true;
+    const bool inRx = radioWatchdogReset(expectPackets);
+    Radio.clearSuspect = false;
+    Radio.modeZeroReads = 0;
+    radioWatchdogStage = 0;
+    radioWatchdogDio1HighTocks = 0;
+    dio1HighSeen = false;
+    SX1280WatchdogPolicy::afterAttempt(retry, inRx, expectPackets, now, millis());
+    radioWatchdogUnverified = SX1280WatchdogPolicy::radioUnverified(retry);
+    DBGLN("radio watchdog: reset, in Rx %d, attempts %u", inRx, retry.failedResets);
+}
+#endif
+
 #if defined(PLATFORM_ESP32_C3)
 void main_loop()
 #else
@@ -2068,6 +2566,9 @@ void loop()
 #endif
 {
     unsigned long now = millis();
+#if defined(RADIO_SX128X)
+    radioWatchdogLoop(now);
+#endif
 
     if (DataUlReceiver.HasFinishedData())
     {
